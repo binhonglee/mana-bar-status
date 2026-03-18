@@ -1,0 +1,41 @@
+name: Outage Report
+description: Report an AI service outage
+title: "[Outage] "
+labels: ["outage"]
+body:
+  - type: dropdown
+    id: service
+    attributes:
+      label: Service
+      description: Which AI service is experiencing issues?
+      options:
+        - Claude Code
+        - Codex
+    validations:
+      required: true
+
+  - type: input
+    id: affected-models
+    attributes:
+      label: Affected Models
+      description: Which specific models are affected? (e.g., "Sonnet 4", "o3-pro")
+      placeholder: e.g., Sonnet 4, Opus
+    validations:
+      required: false
+
+  - type: textarea
+    id: diagnostic-results
+    attributes:
+      label: Diagnostic Results
+      description: Paste the diagnostic results from mana.bar (auto-filled if you used the extension).
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Additional Details
+      description: Any additional context about the outage (error messages, behavior observed, etc.)
+    validations:
+      required: false

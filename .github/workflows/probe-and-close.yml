@@ -1,0 +1,246 @@
+name: Probe and Auto-Close Outages
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'  # Every 15 minutes
+  workflow_dispatch: {}      # Manual trigger for testing
+
+permissions:
+  issues: write
+
+jobs:
+  probe-outages:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe open outages and auto-close resolved ones
+        uses: actions/github-script@v7
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        with:
+          script: |
+            const STALE_HOURS = 24;
+
+            // Only process issues with BOTH 'outage' AND 'verified' labels
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'outage,verified',
+              state: 'open',
+              per_page: 50,
+            });
+
+            if (issues.length === 0) {
+              console.log('No verified outage issues to probe.');
+              return;
+            }
+
+            console.log(`Found ${issues.length} verified outage issue(s) to probe.`);
+
+            for (const issue of issues) {
+              const { title, number } = issue;
+              console.log(`\nProbing issue #${number}: ${title}`);
+
+              // Parse title: "[Outage] Service - Model" or "[Outage] Service"
+              const match = title.match(/^\[Outage\]\s+(.+?)(?:\s+-\s+(.+))?$/);
+              if (!match) {
+                console.log(`  Skipping: title does not match expected format.`);
+                continue;
+              }
+
+              const service = match[1].trim();
+              const model = match[2]?.trim();
+              console.log(`  Service: ${service}, Model: ${model || '(service-wide)'}`);
+
+              let probeSuccess = false;
+              let probeError = '';
+
+              try {
+                if (service === 'Claude Code') {
+                  probeSuccess = await probeClaude(model);
+                } else if (service === 'Codex') {
+                  probeSuccess = await probeCodex(model);
+                } else {
+                  console.log(`  No probe available for service: ${service}`);
+                  // Fall back to stale check
+                  await handleStaleCheck(github, context, issue, STALE_HOURS);
+                  continue;
+                }
+              } catch (error) {
+                probeError = error.message || String(error);
+                console.log(`  Probe error: ${probeError}`);
+                // Skip stale check on probe configuration/network errors to avoid false closures
+                continue;
+              }
+
+              if (probeSuccess) {
+                console.log(`  ✅ Model responded. Closing issue.`);
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: number,
+                  body: `✅ **Verified operational** at ${new Date().toISOString()}\n\nAutomated probe received a successful response from ${model ? `**${model}**` : `**${service}**`}. Auto-closing this issue.\n\nIf the issue persists, please reopen or file a new report.`,
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: number,
+                  state: 'closed',
+                  labels: [...issue.labels.map(l => l.name).filter(l => l !== 'verified'), 'auto-resolved'],
+                });
+              } else {
+                console.log(`  ❌ Model still down. Checking staleness...`);
+                await handleStaleCheck(github, context, issue, STALE_HOURS);
+              }
+            }
+
+            async function handleStaleCheck(github, context, issue, staleHours) {
+              // Check if there's been any activity (comments/reactions) in the last N hours
+              const cutoff = new Date(Date.now() - staleHours * 60 * 60 * 1000);
+              const comments = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                since: cutoff.toISOString(),
+                per_page: 1,
+              });
+
+              if (comments.data.length === 0 && new Date(issue.updated_at) < cutoff) {
+                console.log(`  Stale: no activity in ${staleHours}h. Closing.`);
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: `⏰ **Auto-closed (stale)**: No new reports or activity in the last ${staleHours} hours and the probe did not succeed.\n\nIf this issue persists, please file a new report.`,
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                });
+              }
+            }
+
+            async function probeClaude(model) {
+              const apiKey = process.env.ANTHROPIC_API_KEY;
+              if (!apiKey) {
+                throw new Error('No ANTHROPIC_API_KEY configured.');
+              }
+
+              if (!model) {
+                // Service-wide probe: check all major models
+                const modelsToProbe = ['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-6'];
+                console.log(`  Service-wide outage check: probing ${modelsToProbe.join(', ')}`);
+                for (const m of modelsToProbe) {
+                  const isUp = await probeSingleClaude(apiKey, m);
+                  if (!isUp) {
+                    console.log(`  ❌ ${m} is still down. Service-wide outage continues.`);
+                    return false;
+                  }
+                }
+                console.log(`  ✅ All major Claude models responded successfully.`);
+                return true;
+              }
+
+              let apiModel = model;
+
+              // If it looks like a short name (no "claude-" prefix), try to resolve it
+              if (apiModel && !apiModel.startsWith('claude-')) {
+                // Map short model names to API model aliases (not dated versions)
+                const aliasMap = {
+                  'haiku': 'claude-haiku-4-5',
+                  'sonnet': 'claude-sonnet-4-6',
+                  'opus': 'claude-opus-4-6',
+                };
+                const lowerModel = apiModel.toLowerCase();
+                if (aliasMap[lowerModel]) {
+                  apiModel = aliasMap[lowerModel];
+                  console.log(`  Mapped short name "${model}" to alias "${apiModel}"`);
+                } else {
+                  // Fallback: query /v1/models and find best match
+                  const resolved = await resolveModelFromApi(apiKey, model);
+                  if (resolved) {
+                    apiModel = resolved;
+                    console.log(`  Resolved "${model}" to "${apiModel}" via /v1/models`);
+                  }
+                }
+              }
+
+              // Default if nothing resolved
+              apiModel = apiModel || 'claude-sonnet-4-6';
+              console.log(`  Probing model: ${apiModel}`);
+              return await probeSingleClaude(apiKey, apiModel);
+            }
+
+            async function probeSingleClaude(apiKey, apiModel) {
+              const response = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'x-api-key': apiKey,
+                  'anthropic-version': '2023-06-01',
+                },
+                body: JSON.stringify({
+                  model: apiModel,
+                  max_tokens: 1,
+                  messages: [{ role: 'user', content: 'Reply YES' }],
+                }),
+              });
+
+              console.log(`  Claude probe status for ${apiModel}: ${response.status}`);
+              return response.ok;
+            }
+
+            async function resolveModelFromApi(apiKey, shortName) {
+              try {
+                const response = await fetch('https://api.anthropic.com/v1/models', {
+                  headers: {
+                    'x-api-key': apiKey,
+                    'anthropic-version': '2023-06-01',
+                  },
+                });
+
+                if (!response.ok) {
+                  console.log(`  /v1/models returned ${response.status}`);
+                  return null;
+                }
+
+                const { data } = await response.json();
+
+                // Find models matching the short name, prefer latest by created_at
+                const matches = data
+                  .filter(m => m.id.toLowerCase().includes(shortName.toLowerCase()))
+                  .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+                return matches[0]?.id || null;
+              } catch (error) {
+                console.log(`  Error querying /v1/models: ${error.message}`);
+                return null;
+              }
+            }
+
+            async function probeCodex(model) {
+              const apiKey = process.env.OPENAI_API_KEY;
+              if (!apiKey) {
+                throw new Error('No OPENAI_API_KEY configured.');
+              }
+
+              const apiModel = model || 'o3-mini';
+
+              const response = await fetch('https://api.openai.com/v1/responses', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${apiKey}`,
+                },
+                body: JSON.stringify({
+                  model: apiModel,
+                  input: 'Reply YES',
+                  max_output_tokens: 1,
+                }),
+              });
+
+              console.log(`  Codex probe status: ${response.status}`);
+              return response.ok;
+            }
